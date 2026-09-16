@@ -79,6 +79,19 @@ class DeDietrichDataUpdateCoordinator(DataUpdateCoordinator[UpdateReport]):
             sw_version=str(sw_version) if sw_version is not None else None,
         )
 
+    def bundle_present(self, component: str) -> bool:
+        """Whether the bundle for this component currently reports live readings."""
+        device = self.device
+        if component == "hot_water":
+            return device.hot_water_present
+        if component == "circuit_a":
+            return device.circuit_a_present
+        if component == "circuit_b":
+            return device.circuit_b_present
+        if component == "circuit_c":
+            return isinstance(device, DiematicISystem) and device.circuit_c_present
+        return False
+
     def child_device_info(self, component: str) -> dr.ChildDeviceInfo | None:
         """Return a ChildDeviceInfo for the bundle, or None when no live readings remain.
 
@@ -86,21 +99,8 @@ class DeDietrichDataUpdateCoordinator(DataUpdateCoordinator[UpdateReport]):
         """
         if component not in CHILD_COMPONENT_DEVICE_NAMES:
             return None
-        if component == "hot_water":
-            if not self.device.hot_water_present:
-                return None
-        elif component == "circuit_a":
-            if not self.device.circuit_a_present:
-                return None
-        elif component == "circuit_b":
-            if not self.device.circuit_b_present:
-                return None
-        elif component == "circuit_c":
-            if not (
-                isinstance(self.device, DiematicISystem)
-                and self.device.circuit_c_present
-            ):
-                return None
+        if not self.bundle_present(component):
+            return None
         return dr.ChildDeviceInfo(
             identifiers={(DOMAIN, f"{self.config_entry.entry_id}_{component}")},
             parent_device_id=self.parent_device_id,

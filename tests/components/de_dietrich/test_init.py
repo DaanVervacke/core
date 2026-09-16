@@ -9,6 +9,7 @@ from modbus_connection import ModbusTimeoutError
 from modbus_connection.mock import MockModbusConnection, MockModbusUnit
 import pytest
 
+from homeassistant.components.climate import DOMAIN as CLIMATE_DOMAIN
 from homeassistant.components.de_dietrich.const import DEFAULT_UNIT_ID, DOMAIN
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.components.water_heater import DOMAIN as WATER_HEATER_DOMAIN
@@ -275,32 +276,32 @@ async def test_base_layout_device_info(
         pytest.param(
             seed_isystem_boiler,
             {
-                "circuit_a": ("Heating circuit A", "circuit_a_room_temperature"),
-                "circuit_b": ("Heating circuit B", "circuit_b_room_temperature"),
-                "circuit_c": ("Heating circuit C", "circuit_c_room_temperature"),
+                "circuit_a": "Heating circuit A",
+                "circuit_b": "Heating circuit B",
+                "circuit_c": "Heating circuit C",
             },
             id="isystem",
         ),
         pytest.param(
             seed_boiler,
             {
-                "circuit_a": ("Heating circuit A", "circuit_a_room_temperature"),
-                "circuit_b": ("Heating circuit B", "circuit_b_room_temperature"),
+                "circuit_a": "Heating circuit A",
+                "circuit_b": "Heating circuit B",
             },
             id="base_layout",
         ),
     ],
 )
-async def test_child_devices_route_per_component_sensors(
+async def test_child_devices_route_per_component_climate_entities(
     hass: HomeAssistant,
     device_registry: dr.DeviceRegistry,
     entity_registry: er.EntityRegistry,
     mock_config_entry: MockConfigEntry,
     mock_connection: MockModbusConnection,
     seed_fn: Callable[[MockModbusUnit], None],
-    expected_children: dict[str, tuple[str, str]],
+    expected_children: dict[str, str],
 ) -> None:
-    """Test each present bundle has a child device and its sensors route to it."""
+    """Test each present circuit has a child device and its climate entity routes to it."""
     seed_fn(mock_connection.for_unit(DEFAULT_UNIT_ID))
     mock_config_entry.add_to_hass(hass)
     with patch(
@@ -317,7 +318,7 @@ async def test_child_devices_route_per_component_sensors(
     )
     assert parent is not None
 
-    for bundle, (expected_name, sensor_key) in expected_children.items():
+    for bundle, expected_name in expected_children.items():
         child = device_registry.async_get_child_device_by_identifier(
             (DOMAIN, f"{mock_config_entry.entry_id}_{bundle}"),
             mock_config_entry.entry_id,
@@ -326,12 +327,12 @@ async def test_child_devices_route_per_component_sensors(
         assert child.name == expected_name
 
         entity_id = entity_registry.async_get_entity_id(
-            SENSOR_DOMAIN, DOMAIN, f"{mock_config_entry.entry_id}_{sensor_key}"
+            CLIMATE_DOMAIN, DOMAIN, f"{mock_config_entry.entry_id}_{bundle}"
         )
-        assert entity_id is not None, f"Missing sensor for {bundle}"
-        sensor_entry = entity_registry.async_get(entity_id)
-        assert sensor_entry is not None
-        assert sensor_entry.device_id == child.id
+        assert entity_id is not None, f"Missing climate entity for {bundle}"
+        climate_entry = entity_registry.async_get(entity_id)
+        assert climate_entry is not None
+        assert climate_entry.device_id == child.id
 
     outdoor_entity_id = entity_registry.async_get_entity_id(
         SENSOR_DOMAIN, DOMAIN, f"{mock_config_entry.entry_id}_outdoor_temperature"

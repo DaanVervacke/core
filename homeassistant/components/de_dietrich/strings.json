@@ -25,6 +25,20 @@
     }
   },
   "entity": {
+    "climate": {
+      "circuit": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "antifreeze": "Antifreeze",
+              "auto": "Auto",
+              "day": "Day",
+              "night": "Night"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
       "boiler_temperature": {
         "name": "Boiler temperature"
@@ -76,8 +90,17 @@
     "no_component_answered": {
       "message": "No component answered."
     },
+    "set_circuit_temperature_auto_error": {
+      "message": "Failed to set the target temperature. Switch the circuit's preset away from auto first."
+    },
+    "set_circuit_temperature_error": {
+      "message": "Failed to set the heating circuit's target temperature."
+    },
     "set_operation_mode_error": {
       "message": "Failed to set the hot water operating mode."
+    },
+    "set_preset_mode_error": {
+      "message": "Failed to set the heating circuit's preset mode."
     },
     "set_temperature_error": {
       "message": "Failed to set the hot water target temperature."

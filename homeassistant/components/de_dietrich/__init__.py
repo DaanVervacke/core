@@ -21,6 +21,7 @@ from .coordinator import DeDietrichConfigEntry, DeDietrichDataUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [
+    Platform.CLIMATE,
     Platform.SENSOR,
     Platform.WATER_HEATER,
 ]
