@@ -1,5 +1,7 @@
 """Test the ENGIE Belgium config flow."""
 
+import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aioengiebelgium import (
@@ -11,19 +13,37 @@ from aioengiebelgium import (
 )
 import pytest
 from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.recorder.common import async_wait_recording_done
 
 from homeassistant import config_entries
 from homeassistant.components.engie_be.const import (
+    CONF_HISTORY,
     CONF_MFA_METHOD,
     CONF_REFRESH_TOKEN,
     DOMAIN,
+    HistoryDepth,
 )
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import get_last_statistics
+from homeassistant.config_entries import ConfigFlowResult
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .conftest import EMAIL, PASSWORD, SUBJECT
+from .conftest import BAN, EMAIL, PASSWORD, SUBJECT
+
+
+async def _skip_history(
+    hass: HomeAssistant, result: ConfigFlowResult
+) -> ConfigFlowResult:
+    """Decline the usage history import on the history step."""
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "history"
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_HISTORY: HistoryDepth.NONE}
+    )
+
 
 USER_INPUT = {
     CONF_EMAIL: EMAIL,
@@ -65,13 +85,17 @@ async def test_full_flow(
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {"code": "123456"}
     )
+    result = await _skip_history(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == EMAIL
     assert result["data"][CONF_EMAIL] == EMAIL
     assert result["data"]["access_token"] == "new-access-token"
     assert result["data"]["refresh_token"] == "new-refresh-token"
+    assert result["data"][CONF_HISTORY] == HistoryDepth.NONE
     assert CONF_PASSWORD not in result["data"]
     assert result["result"].unique_id == SUBJECT
+    assert result["result"].minor_version == 2
+    mock_engie_client.return_value.async_get_usage_details.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -113,6 +137,7 @@ async def test_user_step_errors(
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {"code": "123456"}
     )
+    result = await _skip_history(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert mock_setup_entry.called
 
@@ -157,6 +182,7 @@ async def test_mfa_submit_errors_recovery(
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {"code": "123456"}
     )
+    result = await _skip_history(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert mock_setup_entry.called
 
@@ -207,6 +233,7 @@ async def test_two_accounts_get_distinct_entries(
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {"code": "123456"}
         )
+        result = await _skip_history(hass, result)
         assert result["type"] is FlowResultType.CREATE_ENTRY
 
     entries = hass.config_entries.async_entries(DOMAIN)
@@ -241,6 +268,7 @@ async def test_jwt_subject_missing_shows_form_error(
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {"code": "123456"}
     )
+    result = await _skip_history(hass, result)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert mock_setup_entry.called
 
@@ -280,6 +308,7 @@ async def test_reauth_flow(
         CONF_MFA_METHOD: "sms",
         CONF_ACCESS_TOKEN: "new-access-token",
         CONF_REFRESH_TOKEN: "new-refresh-token",
+        CONF_HISTORY: HistoryDepth.NONE,
     }
 
 
@@ -350,3 +379,86 @@ async def test_reauth_flow_unique_id_mismatch(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "unique_id_mismatch"
     assert mock_config_entry.data[CONF_ACCESS_TOKEN] == "access-token"
+
+
+async def _start_flow_to_history(hass: HomeAssistant) -> ConfigFlowResult:
+    """Sign in and return the history step."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], USER_INPUT
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"code": "123456"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "history"
+    return result
+
+
+@pytest.mark.usefixtures("frozen_afternoon", "mock_setup_entry")
+async def test_history_import(
+    hass: HomeAssistant,
+    mock_engie_client: MagicMock,
+) -> None:
+    """Test the usage history is imported before the entry is created."""
+    mock_engie_client.return_value.subject = SUBJECT
+    result = await _start_flow_to_history(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_HISTORY: HistoryDepth.YEAR}
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+    assert result["step_id"] == "import_history"
+    assert result["progress_action"] == "import_history"
+
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_HISTORY] == HistoryDepth.YEAR
+    assert result["result"].unique_id == SUBJECT
+
+    await async_wait_recording_done(hass)
+    last = await get_instance(hass).async_add_executor_job(
+        get_last_statistics,
+        hass,
+        1,
+        f"{DOMAIN}:{BAN}_electricity_offtake",
+        False,
+        {"sum"},
+    )
+    assert last[f"{DOMAIN}:{BAN}_electricity_offtake"]
+
+
+@pytest.mark.usefixtures("frozen_afternoon", "mock_setup_entry")
+async def test_history_import_failure_still_creates_entry(
+    hass: HomeAssistant,
+    mock_engie_client: MagicMock,
+) -> None:
+    """Test a failed history import still creates the entry after confirmation."""
+    mock_engie_client.return_value.subject = SUBJECT
+    release = asyncio.Event()
+
+    async def failing_usage(*args: Any) -> None:
+        await release.wait()
+        raise EngieBeCommunicationError("boom")
+
+    mock_engie_client.return_value.async_get_usage_details.side_effect = failing_usage
+    result = await _start_flow_to_history(hass)
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_HISTORY: HistoryDepth.ALL}
+    )
+    assert result["type"] is FlowResultType.SHOW_PROGRESS
+
+    release.set()
+    await hass.async_block_till_done()
+    result = await hass.config_entries.flow.async_configure(result["flow_id"])
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "import_failed"
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_HISTORY] == HistoryDepth.ALL
+    assert result["result"].unique_id == SUBJECT

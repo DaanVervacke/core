@@ -15,11 +15,19 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import CONF_REFRESH_TOKEN, CONTRACTS_RETRY_INTERVAL, DOMAIN, LOGGER
+from .const import (
+    CONF_HISTORY,
+    CONF_REFRESH_TOKEN,
+    CONTRACTS_RETRY_INTERVAL,
+    DOMAIN,
+    LOGGER,
+    HistoryDepth,
+)
 from .coordinator import (
     EngieBeEpexCoordinator,
     EngieBePricesCoordinator,
     EngieBeRelationsCoordinator,
+    EngieBeStatisticsCoordinator,
     mask_identifier,
 )
 
@@ -32,6 +40,7 @@ class EngieBeHouseholdCoordinators:
 
     prices: EngieBePricesCoordinator
     is_dynamic: bool | None
+    statistics: EngieBeStatisticsCoordinator | None = None
 
 
 @dataclass
@@ -96,6 +105,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) -> N
     await relations.async_config_entry_first_refresh()
 
     device_registry = dr.async_get(hass)
+    depth = HistoryDepth(entry.data[CONF_HISTORY])
 
     @callback
     def _async_create_household(
@@ -107,6 +117,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) -> N
                 hass, entry, client, ban, relations.data[ban]
             ),
             is_dynamic=is_dynamic,
+            statistics=None
+            if depth is HistoryDepth.NONE
+            else EngieBeStatisticsCoordinator(
+                hass, entry, client, ban, relations.data[ban], depth
+            ),
         )
         device_registry.async_get_or_create_from_info(
             config_entry_id=entry.entry_id, device_info=household.prices.device_info
@@ -149,6 +164,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) -> N
         _async_start_tariff_retry(hass, entry, epex)
 
     await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
+
+    for household in households.values():
+        if (statistics := household.statistics) is None:
+            continue
+        entry.async_on_unload(statistics.async_add_listener(async_noop))
+        entry.async_create_background_task(
+            hass, statistics.async_refresh(), "engie_be statistics import"
+        )
 
 
 @callback
@@ -200,6 +223,16 @@ def _async_start_tariff_retry(
         hass, _start_retry_classification, CONTRACTS_RETRY_INTERVAL
     )
     entry.async_on_unload(cancel_retry)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) -> None:
+    """Migrate an older config entry."""
+    if entry.minor_version < 2:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_HISTORY: HistoryDepth.NONE},
+            minor_version=2,
+        )
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) -> None:

@@ -1,7 +1,8 @@
 """Config flow for the ENGIE Belgium integration."""
 
+import asyncio
 from collections.abc import Mapping
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, override
 
 from aioengiebelgium import (
     AuthFlow,
@@ -14,12 +15,23 @@ from aioengiebelgium import (
 )
 import probatio
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .const import CONF_MFA_METHOD, CONF_REFRESH_TOKEN, DOMAIN, USER_MANAGEMENT_URL
+from .const import (
+    CONF_HISTORY,
+    CONF_MFA_METHOD,
+    CONF_REFRESH_TOKEN,
+    DOMAIN,
+    LOGGER,
+    USER_MANAGEMENT_URL,
+    HistoryDepth,
+)
+from .coordinator import active_agreements, household_name
+from .importer import async_import_household_statistics
 
 _MFA_METHOD_SELECTOR = selector.SelectSelector(
     selector.SelectSelectorConfig(
@@ -28,12 +40,25 @@ _MFA_METHOD_SELECTOR = selector.SelectSelector(
     )
 )
 _CODE_SCHEMA = probatio.Schema({probatio.Required("code"): str})
+_HISTORY_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_HISTORY, default=HistoryDepth.YEAR.value): (
+            selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[depth.value for depth in HistoryDepth],
+                    translation_key=CONF_HISTORY,
+                )
+            )
+        )
+    }
+)
 
 
 class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for ENGIE Belgium."""
 
     VERSION = 1
+    MINOR_VERSION = 2
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -42,6 +67,10 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._mfa_method: MfaMethod = MfaMethod.SMS
         self._auth_flow: AuthFlow | None = None
         self._client: EngieBeClient | None = None
+        self._tokens: tuple[str, str] | None = None
+        self._depth = HistoryDepth.NONE
+        self._import_task: asyncio.Task[bool] | None = None
+        self._import_failed_shown = False
 
     async def _async_start_authentication(
         self, user_input: dict[str, Any]
@@ -173,16 +202,88 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
                         },
                     )
                 self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=self._email,
-                    data={
-                        CONF_EMAIL: self._email,
-                        CONF_MFA_METHOD: self._mfa_method.value,
-                        CONF_ACCESS_TOKEN: access_token,
-                        CONF_REFRESH_TOKEN: refresh_token,
-                    },
-                )
+                self._tokens = tokens
+                return await self.async_step_history()
 
         return self.async_show_form(
             step_id="mfa", data_schema=_CODE_SCHEMA, errors=errors
+        )
+
+    async def async_step_history(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask how much usage history to import into the energy dashboard."""
+        if user_input is None:
+            return self.async_show_form(step_id="history", data_schema=_HISTORY_SCHEMA)
+        self._depth = HistoryDepth(user_input[CONF_HISTORY])
+        if self._depth is HistoryDepth.NONE:
+            return self._async_create_account_entry()
+        return await self.async_step_import_history()
+
+    async def async_step_import_history(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Import the usage history while showing progress."""
+        if self._import_task is None:
+            self._import_task = self.hass.async_create_task(
+                self._async_import_history(), "engie_be history import"
+            )
+        if not self._import_task.done():
+            return self.async_show_progress(
+                step_id="import_history",
+                progress_action="import_history",
+                progress_task=self._import_task,
+            )
+        if self._import_task.result():
+            return self.async_show_progress_done(next_step_id="finish")
+        return self.async_show_progress_done(next_step_id="import_failed")
+
+    async def async_step_finish(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Create the entry after a successful history import."""
+        return self._async_create_account_entry()
+
+    async def async_step_import_failed(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Tell the user the import is retried after setup, then create the entry."""
+        # A progress task that finishes at once forwards the history step's input here.
+        if not self._import_failed_shown:
+            self._import_failed_shown = True
+            return self.async_show_form(step_id="import_failed")
+        return self._async_create_account_entry()
+
+    async def _async_import_history(self) -> bool:
+        """Import the usage history of every household and return whether it worked."""
+        client = self._client
+        if TYPE_CHECKING:
+            assert client is not None
+        try:
+            relations = await client.async_get_customer_account_relations()
+            for ban, agreement in active_agreements(relations).items():
+                await async_import_household_statistics(
+                    self.hass, client, ban, household_name(ban, agreement), self._depth
+                )
+        except EngieBeError as err:
+            LOGGER.warning("Importing the usage history failed: %s", err)
+            return False
+        await get_instance(self.hass).async_block_till_done()
+        return True
+
+    def _async_create_account_entry(self) -> ConfigFlowResult:
+        """Create the config entry with the tokens and the chosen history depth."""
+        if TYPE_CHECKING:
+            assert self._email is not None
+            assert self._tokens is not None
+        access_token, refresh_token = self._tokens
+        return self.async_create_entry(
+            title=self._email,
+            data={
+                CONF_EMAIL: self._email,
+                CONF_MFA_METHOD: self._mfa_method.value,
+                CONF_ACCESS_TOKEN: access_token,
+                CONF_REFRESH_TOKEN: refresh_token,
+                CONF_HISTORY: self._depth.value,
+            },
         )

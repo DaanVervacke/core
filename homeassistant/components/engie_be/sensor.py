@@ -19,9 +19,8 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import ATTRIBUTION
+from .const import ATTRIBUTION, BRUSSELS_TIME_ZONE
 from .coordinator import (
-    BRUSSELS_TIME_ZONE,
     EngieBeEpexCoordinator,
     EngieBeEpexData,
     EngieBePricesCoordinator,

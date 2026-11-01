@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from itertools import pairwise
 from typing import TYPE_CHECKING, override
-from zoneinfo import ZoneInfo
 
 from aioengiebelgium import (
     BusinessAgreement,
+    CustomerAccountRelations,
     EngieBeAuthenticationError,
     EngieBeClient,
     EngieBeError,
@@ -29,7 +29,16 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 from homeassistant.util.signal_type import SignalTypeFormat
 
-from .const import DOMAIN, EPEX_SCAN_INTERVAL, LOGGER, PRICES_SCAN_INTERVAL
+from .const import (
+    BRUSSELS_TIME_ZONE,
+    DOMAIN,
+    EPEX_SCAN_INTERVAL,
+    LOGGER,
+    PRICES_SCAN_INTERVAL,
+    STATISTICS_SCAN_INTERVAL,
+    HistoryDepth,
+)
+from .importer import async_import_household_statistics
 
 if TYPE_CHECKING:
     from . import EngieBeConfigEntry
@@ -37,8 +46,6 @@ if TYPE_CHECKING:
 _DIRECTIONS = ("offtake", "injection")
 _DIRECTION_PREFIXES = ("OFFTAKE_", "INJECTION_")
 _BLENDED_SLOT_CODE = "EN"
-
-BRUSSELS_TIME_ZONE = ZoneInfo("Europe/Brussels")
 
 SIGNAL_EPEX_UPDATED: SignalTypeFormat[EngieBeEpexCoordinator] = SignalTypeFormat(
     f"{DOMAIN}_{{}}_epex_updated"
@@ -57,6 +64,28 @@ def normalize_slot_code(raw_code: str) -> str:
         if idx != -1:
             return raw_code[idx + len(prefix) :]
     return raw_code
+
+
+def active_agreements(
+    relations: CustomerAccountRelations,
+) -> dict[str, BusinessAgreement]:
+    """Return the active business agreements of the account, keyed by number."""
+    return {
+        agreement.business_agreement_number: agreement
+        for account in relations.accounts
+        for agreement in account.customer_account.business_agreements
+        if agreement.active
+    }
+
+
+def household_name(ban: str, agreement: BusinessAgreement) -> str:
+    """Return the display name of a household, preferring its address."""
+    address = (
+        agreement.consumption_address.format()
+        if agreement.consumption_address is not None
+        else ""
+    )
+    return address or ban
 
 
 def _current_period(
@@ -109,12 +138,7 @@ class EngieBeRelationsCoordinator(DataUpdateCoordinator[dict[str, BusinessAgreem
         except EngieBeError as err:
             raise UpdateFailed(str(err)) from err
 
-        agreements = {
-            agreement.business_agreement_number: agreement
-            for account in relations.accounts
-            for agreement in account.customer_account.business_agreements
-            if agreement.active
-        }
+        agreements = active_agreements(relations)
         if not agreements:
             LOGGER.debug("No active business agreements found")
         return agreements
@@ -145,16 +169,11 @@ class EngieBePricesCoordinator(DataUpdateCoordinator[EngieBePricesData]):
         self.ban = ban
         self.agreement = agreement
         self.ean_energy_types: dict[str, str | None] = {}
-        device_name = (
-            agreement.consumption_address.format()
-            if agreement.consumption_address is not None
-            else ""
-        ) or ban
         self.device_info = DeviceInfo(
             identifiers={(DOMAIN, ban)},
             entry_type=DeviceEntryType.SERVICE,
             manufacturer="ENGIE Belgium",
-            name=device_name,
+            name=household_name(ban, agreement),
         )
 
     @override
@@ -418,3 +437,47 @@ class EngieBeEpexCoordinator(DataUpdateCoordinator[EngieBeEpexData]):
                 )
             ),
         )
+
+
+class EngieBeStatisticsCoordinator(DataUpdateCoordinator[None]):
+    """Coordinator that imports the usage history of one business agreement."""
+
+    config_entry: EngieBeConfigEntry
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: EngieBeConfigEntry,
+        client: EngieBeClient,
+        ban: str,
+        agreement: BusinessAgreement,
+        depth: HistoryDepth,
+    ) -> None:
+        """Initialize the statistics coordinator for one business agreement."""
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=config_entry,
+            name=f"{DOMAIN}_statistics_{mask_identifier(ban)}",
+            update_interval=STATISTICS_SCAN_INTERVAL,
+        )
+        self.client = client
+        self.ban = ban
+        self.household_name = household_name(ban, agreement)
+        self.depth = depth
+
+    @override
+    async def _async_update_data(self) -> None:
+        """Import the usage and costs that are not stored yet."""
+        try:
+            await async_import_household_statistics(
+                self.hass, self.client, self.ban, self.household_name, self.depth
+            )
+        except EngieBeAuthenticationError as err:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN, translation_key="invalid_auth"
+            ) from err
+        except EngieBeError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN, translation_key="cannot_connect"
+            ) from err

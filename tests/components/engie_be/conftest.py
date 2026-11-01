@@ -1,7 +1,7 @@
 """Common fixtures for the ENGIE Belgium tests."""
 
 from collections.abc import Generator
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ from aioengiebelgium import (
     ConsumptionAddress,
     CustomerAccount,
     CustomerAccountRelations,
+    DataAvailability,
     EanPrices,
     EnergyContract,
     EnergyContractsResponse,
@@ -19,22 +20,36 @@ from aioengiebelgium import (
     EpexGranularity,
     EpexPayload,
     EpexSlot,
+    GasUsage,
+    MeasuredDataWindow,
+    MeteringServicePoint,
     PricePeriod,
     PriceSlot,
     PricesResponse,
     ProductConfiguration,
     ServicePoint,
+    ServicePointsResponse,
+    UsageDetailsResponse,
+    UsageDirectionBreakdown,
+    UsageElectricityBreakdown,
+    UsageGranularity,
+    UsageItem,
+    UsageTouPart,
     bare_ean,
 )
 from freezegun.api import FrozenDateTimeFactory
 import pytest
 from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.typing import RecorderInstanceContextManager
 
 from homeassistant.components.engie_be.const import (
+    CONF_HISTORY,
     CONF_MFA_METHOD,
     CONF_REFRESH_TOKEN,
     DOMAIN,
+    HistoryDepth,
 )
+from homeassistant.components.recorder import Recorder
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_EMAIL
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import device_registry as dr
@@ -176,6 +191,110 @@ def build_contracts(*, dynamic: bool = False) -> EnergyContractsResponse:
     )
 
 
+DAILY_FROM = date(2026, 9, 20)
+ELECTRICITY_QUARTER_HOURLY_FROM = datetime(2026, 9, 28, tzinfo=BRUSSELS_TIME_ZONE)
+GAS_QUARTER_HOURLY_FROM = datetime(2026, 9, 29, 7, tzinfo=BRUSSELS_TIME_ZONE)
+PARTIAL_DAY = date(2026, 10, 2)
+
+
+def _measured_point(
+    ean: str, division: str, quarter_hourly_from: datetime
+) -> MeteringServicePoint:
+    """Build a metering service point with daily and quarter-hourly data."""
+    return MeteringServicePoint(
+        ean=bare_ean(ean),
+        division=division,
+        data_availability=DataAvailability(
+            quarter_hourly=MeasuredDataWindow(
+                available=True,
+                start=quarter_hourly_from,
+                end=datetime(2026, 10, 2, 23, 45, tzinfo=BRUSSELS_TIME_ZONE),
+            ),
+            daily=MeasuredDataWindow(
+                available=True,
+                start=datetime.combine(DAILY_FROM, time(), BRUSSELS_TIME_ZONE),
+                end=datetime(2026, 10, 2, tzinfo=BRUSSELS_TIME_ZONE),
+            ),
+        ),
+    )
+
+
+def build_service_points(ban: str) -> ServicePointsResponse:
+    """Build the metering service points of a dual-fuel household."""
+    return ServicePointsResponse(
+        items=(
+            _measured_point(OFFTAKE_ONLY_EAN, "GAS", GAS_QUARTER_HOURLY_FROM),
+            _measured_point(
+                OFFTAKE_INJECTION_EAN, "ELECTRICITY", ELECTRICITY_QUARTER_HOURLY_FROM
+            ),
+        )
+    )
+
+
+def _daily_item(day: date) -> UsageItem:
+    """Build a daily usage bucket with a day/night split and costs."""
+    offtake = 10.0 + day.day
+    start = datetime.combine(day, time(), BRUSSELS_TIME_ZONE)
+    return UsageItem(
+        start=_api_timestamp(start.astimezone(UTC)),
+        end=_api_timestamp((start + timedelta(days=1)).astimezone(UTC)),
+        partial_data=day == PARTIAL_DAY,
+        gas=GasUsage(kwh=20.0, cost=2.0),
+        energy=UsageElectricityBreakdown(
+            offtake=UsageDirectionBreakdown(
+                kwh_sum=offtake,
+                supplier_parts=(
+                    UsageTouPart(slot_code="HIGH_LOAD_HOURS", value=offtake * 0.6),
+                    UsageTouPart(slot_code="LOW_LOAD_HOURS", value=offtake * 0.4),
+                ),
+            ),
+            injection=UsageDirectionBreakdown(
+                kwh_sum=2.0,
+                supplier_parts=(UsageTouPart(slot_code="TOTAL_HOURS", value=2.0),),
+            ),
+        ),
+        costs=UsageElectricityBreakdown(
+            offtake=UsageDirectionBreakdown(amount_sum=round(offtake * 0.3, 2)),
+            injection=UsageDirectionBreakdown(amount_sum=0.1),
+        ),
+    )
+
+
+def _hourly_item(start: datetime) -> UsageItem:
+    """Build an hourly usage bucket without split or costs, like the API sends."""
+    local = start.astimezone(BRUSSELS_TIME_ZONE)
+    return UsageItem(
+        start=_api_timestamp(start.astimezone(UTC)),
+        end=_api_timestamp((start + timedelta(hours=1)).astimezone(UTC)),
+        partial_data=local.date() == PARTIAL_DAY and local.hour >= 20,
+        gas=GasUsage(kwh=1.0),
+        energy=UsageElectricityBreakdown(
+            offtake=UsageDirectionBreakdown(kwh_sum=0.5),
+            injection=UsageDirectionBreakdown(kwh_sum=0.1),
+        ),
+    )
+
+
+def build_usage_details(
+    ban: str, start_date: date, end_date: date, granularity: UsageGranularity
+) -> UsageDetailsResponse:
+    """Build the usage buckets from the start up to the end day within the data window."""
+    first = datetime.combine(max(start_date, DAILY_FROM), time(), BRUSSELS_TIME_ZONE)
+    end = datetime.combine(end_date, time(), BRUSSELS_TIME_ZONE)
+    items: list[UsageItem] = []
+    if granularity is UsageGranularity.DAILY:
+        day = first.date()
+        while day < end_date:
+            items.append(_daily_item(day))
+            day += timedelta(days=1)
+        return UsageDetailsResponse(items=tuple(items))
+    moment = max(first, ELECTRICITY_QUARTER_HOURLY_FROM).astimezone(UTC)
+    while moment < end.astimezone(UTC):
+        items.append(_hourly_item(moment))
+        moment += timedelta(hours=1)
+    return UsageDetailsResponse(items=tuple(items))
+
+
 def _api_timestamp(moment: datetime) -> datetime:
     """Return a timestamp carrying the fixed Brussels offset the API would send."""
     wall = BRUSSELS_TIME_ZONE.fromutc(moment.replace(tzinfo=BRUSSELS_TIME_ZONE))
@@ -274,18 +393,22 @@ def build_epex_payload_with_negative_current(
 
 
 def build_config_entry(
-    unique_id: str = SUBJECT, access_token: str = "access-token"
+    unique_id: str = SUBJECT,
+    access_token: str = "access-token",
+    history: HistoryDepth = HistoryDepth.NONE,
 ) -> MockConfigEntry:
     """Build a mock config entry for one ENGIE Belgium account."""
     return MockConfigEntry(
         domain=DOMAIN,
         title=EMAIL,
         unique_id=unique_id,
+        minor_version=2,
         data={
             CONF_EMAIL: EMAIL,
             CONF_MFA_METHOD: "sms",
             CONF_ACCESS_TOKEN: access_token,
             CONF_REFRESH_TOKEN: "refresh-token",
+            CONF_HISTORY: history.value,
         },
     )
 
@@ -304,10 +427,21 @@ def configure_client(client: MagicMock, auth_flow: MagicMock) -> None:
     client.async_get_energy_contracts.return_value = build_contracts()
     client.async_get_epex_prices.side_effect = build_epex_payload
     client.async_start_authentication.return_value = auth_flow
+    client.async_get_service_points.side_effect = build_service_points
+    client.async_get_usage_details.side_effect = build_usage_details
 
 
 @pytest.fixture
-def mock_engie_client(mock_auth_flow: MagicMock) -> Generator[MagicMock]:
+async def mock_recorder_before_hass(
+    async_test_recorder: RecorderInstanceContextManager,
+) -> None:
+    """Set up the recorder before the hass fixture runs."""
+
+
+@pytest.fixture
+def mock_engie_client(
+    recorder_mock: Recorder, mock_auth_flow: MagicMock
+) -> Generator[MagicMock]:
     """Mock the EngieBeClient class constructed by the integration and config flow."""
     with (
         patch(
@@ -333,7 +467,7 @@ def mock_auth_flow() -> MagicMock:
 
 
 @pytest.fixture
-def mock_setup_entry() -> Generator[AsyncMock]:
+def mock_setup_entry(recorder_mock: Recorder) -> Generator[AsyncMock]:
     """Override async_setup_entry."""
     with patch(
         "homeassistant.components.engie_be.async_setup_entry", return_value=None

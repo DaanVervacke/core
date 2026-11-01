@@ -76,7 +76,24 @@
       "invalid_mfa_code": "Invalid verification code. Please try again.",
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
+    "progress": {
+      "import_history": "Importing your usage history from ENGIE Belgium. This can take a few minutes."
+    },
     "step": {
+      "history": {
+        "data": {
+          "history": "Usage history to import"
+        },
+        "data_description": {
+          "history": "How much of your past electricity and gas usage and costs to import into the energy dashboard. After setup, new usage is imported automatically. Choose None to skip importing statistics."
+        },
+        "description": "Import your past usage and costs from ENGIE Belgium into the Home Assistant energy dashboard. The history is limited to the data ENGIE Belgium has for your meters.",
+        "title": "Import usage history"
+      },
+      "import_failed": {
+        "description": "Importing your usage history did not succeed. The integration is still set up and retries the import in the background.",
+        "title": "Usage history not imported"
+      },
       "mfa": {
         "data": {
           "code": "Verification code"
@@ -459,6 +476,14 @@
     }
   },
   "selector": {
+    "history": {
+      "options": {
+        "all": "Everything available",
+        "month": "Last month",
+        "none": "None",
+        "year": "Last year"
+      }
+    },
     "mfa_method": {
       "options": {
         "email": "Email",
