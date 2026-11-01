@@ -105,7 +105,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) -> N
     await relations.async_config_entry_first_refresh()
 
     device_registry = dr.async_get(hass)
-    depth = HistoryDepth(entry.data[CONF_HISTORY])
+    depth = HistoryDepth(entry.options[CONF_HISTORY])
 
     @callback
     def _async_create_household(
@@ -230,7 +230,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EngieBeConfigEntry) ->
     if entry.minor_version < 2:
         hass.config_entries.async_update_entry(
             entry,
-            data={**entry.data, CONF_HISTORY: HistoryDepth.NONE},
+            options={**entry.options, CONF_HISTORY: HistoryDepth.NONE},
             minor_version=2,
         )
 

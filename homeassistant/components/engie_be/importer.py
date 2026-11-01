@@ -20,6 +20,7 @@ from homeassistant.components.recorder.models import (
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
+    StatisticsRow,
     async_add_external_statistics,
     get_last_statistics,
     statistics_during_period,
@@ -117,8 +118,9 @@ def _earliest(first: date | None, second: date | None) -> date | None:
 
 
 def _latest(first: date | None, second: date | None) -> date | None:
+    """Return the later day, or None when either meter lacks hourly data."""
     if first is None or second is None:
-        return first or second
+        return None
     return max(first, second)
 
 
@@ -284,22 +286,32 @@ async def _async_last_start(hass: HomeAssistant, stat_id: str) -> datetime | Non
     return dt_util.utc_from_timestamp(rows[0]["start"])
 
 
-async def _async_baseline(
-    hass: HomeAssistant, stat_id: str, first_start: datetime
-) -> float:
-    """Return the stored sum just before the first bucket that is about to be written."""
-    stored = await get_instance(hass).async_add_executor_job(
+async def _async_stored_rows(
+    hass: HomeAssistant,
+    statistic_ids: set[str],
+    start: datetime,
+    end: datetime | None,
+) -> dict[str, list[StatisticsRow]]:
+    return await get_instance(hass).async_add_executor_job(
         statistics_during_period,
         hass,
-        first_start,
-        None,
-        {stat_id},
+        start,
+        end,
+        statistic_ids,
         "hour",
         None,
         {"sum", "state"},
     )
-    if rows := stored.get(stat_id):
-        return (rows[0].get("sum") or 0.0) - (rows[0].get("state") or 0.0)
+
+
+async def _async_baseline(
+    hass: HomeAssistant, stat_id: str, first_start: datetime
+) -> float:
+    """Return the stored sum just before the first bucket that is about to be written."""
+    for end in (first_start + timedelta(seconds=1), None):
+        stored = await _async_stored_rows(hass, {stat_id}, first_start, end)
+        if rows := stored.get(stat_id):
+            return (rows[0].get("sum") or 0.0) - (rows[0].get("state") or 0.0)
     last = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 1, stat_id, False, {"sum"}
     )
@@ -308,14 +320,39 @@ async def _async_baseline(
     return 0.0
 
 
+async def _async_stored_hourly_from(
+    hass: HomeAssistant, ban: str, divisions: Iterable[str], start: datetime
+) -> dict[str, date]:
+    """Return per division the first day from the start that is stored hourly."""
+    anchors = {
+        statistic_id(ban, _ANCHOR_KEYS[division]): division for division in divisions
+    }
+    stored = await _async_stored_rows(hass, set(anchors), start, None)
+    hourly_from: dict[str, date] = {}
+    for stat_id, rows in stored.items():
+        local_starts = (
+            dt_util.utc_from_timestamp(row["start"]).astimezone(BRUSSELS_TIME_ZONE)
+            for row in rows
+        )
+        if first := next((moment for moment in local_starts if moment.hour), None):
+            hourly_from[anchors[stat_id]] = first.date()
+    return hourly_from
+
+
 async def async_import_household_statistics(
     hass: HomeAssistant,
     client: EngieBeClient,
     ban: str,
     household_name: str,
     depth: HistoryDepth,
+    *,
+    backfill: bool = False,
 ) -> None:
-    """Import the usage and costs of one household into external statistics."""
+    """Import the usage and costs of one household into external statistics.
+
+    Without stored statistics, or when asked to backfill, the import starts as far
+    back as the depth allows. Otherwise it re-imports the correction window.
+    """
     today = dt_util.now(BRUSSELS_TIME_ZONE).date()
     service_points = await client.async_get_service_points(ban)
     windows = meter_windows(service_points.items) or {
@@ -323,33 +360,52 @@ async def async_import_household_statistics(
         for division in _ANCHOR_KEYS
     }
 
-    starts: list[date] = []
-    for division, window in windows.items():
-        last = await _async_last_start(hass, statistic_id(ban, _ANCHOR_KEYS[division]))
-        starts.append(
-            backfill_start(window, depth, today)
-            if last is None
-            else _local_date(last) - CORRECTION_WINDOW
+    lasts = [
+        last
+        for division in windows
+        if (
+            last := await _async_last_start(
+                hass, statistic_id(ban, _ANCHOR_KEYS[division])
+            )
         )
-    start = min(starts)
+        is not None
+    ]
+    if backfill or not lasts:
+        start = min(backfill_start(window, depth, today) for window in windows.values())
+    else:
+        start = _local_date(min(lasts)) - CORRECTION_WINDOW
     if start >= today:
         return
+
+    # Days already stored hourly must stay hourly, or their hourly rows would linger.
+    stored_hourly_from = await _async_stored_hourly_from(
+        hass,
+        ban,
+        _ANCHOR_KEYS,
+        datetime.combine(start, time(), BRUSSELS_TIME_ZONE),
+    )
+    hourly_from = {
+        division: _earliest(
+            windows[division].hourly_from if division in windows else None,
+            stored_hourly_from.get(division),
+        )
+        for division in _ANCHOR_KEYS
+    }
 
     daily = await _async_fetch_usage(
         client, ban, start, today, UsageGranularity.DAILY, DAILY_CHUNK
     )
     hourly: dict[datetime, UsageItem] = {}
-    hourly_froms = [w.hourly_from for w in windows.values() if w.hourly_from]
+    hourly_froms = [day for day in hourly_from.values() if day is not None]
     if hourly_froms and (hourly_start := max(start, min(hourly_froms))) < today:
         hourly = await _async_fetch_usage(
             client, ban, hourly_start, today, UsageGranularity.HOURLY, HOURLY_CHUNK
         )
 
     builder = _SeriesBuilder(household_name)
-    no_window = MeterWindow(daily_from=None, hourly_from=None)
-    for item in _select(daily, hourly, windows.get(ELECTRICITY, no_window).hourly_from):
+    for item in _select(daily, hourly, hourly_from.get(ELECTRICITY)):
         builder.add_energy(item)
-    for item in _select(daily, hourly, windows.get(GAS, no_window).hourly_from):
+    for item in _select(daily, hourly, hourly_from.get(GAS)):
         builder.add_gas(item)
     for item in sorted(daily.values(), key=lambda item: item.start):
         builder.add_daily_details(item)

@@ -1,6 +1,7 @@
 """Common fixtures for the ENGIE Belgium tests."""
 
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -195,10 +196,17 @@ DAILY_FROM = date(2026, 9, 20)
 ELECTRICITY_QUARTER_HOURLY_FROM = datetime(2026, 9, 28, tzinfo=BRUSSELS_TIME_ZONE)
 GAS_QUARTER_HOURLY_FROM = datetime(2026, 9, 29, 7, tzinfo=BRUSSELS_TIME_ZONE)
 PARTIAL_DAY = date(2026, 10, 2)
+OFFTAKE_STATISTIC_ID = f"{DOMAIN}:{BAN}_electricity_offtake"
+GAS_STATISTIC_ID = f"{DOMAIN}:{BAN}_gas"
 
 
-def _measured_point(
-    ean: str, division: str, quarter_hourly_from: datetime
+def build_measured_point(
+    ean: str,
+    division: str,
+    quarter_hourly_from: datetime = ELECTRICITY_QUARTER_HOURLY_FROM,
+    daily_from: date = DAILY_FROM,
+    *,
+    available: bool = True,
 ) -> MeteringServicePoint:
     """Build a metering service point with daily and quarter-hourly data."""
     return MeteringServicePoint(
@@ -206,13 +214,13 @@ def _measured_point(
         division=division,
         data_availability=DataAvailability(
             quarter_hourly=MeasuredDataWindow(
-                available=True,
+                available=available,
                 start=quarter_hourly_from,
                 end=datetime(2026, 10, 2, 23, 45, tzinfo=BRUSSELS_TIME_ZONE),
             ),
             daily=MeasuredDataWindow(
-                available=True,
-                start=datetime.combine(DAILY_FROM, time(), BRUSSELS_TIME_ZONE),
+                available=available,
+                start=datetime.combine(daily_from, time(), BRUSSELS_TIME_ZONE),
                 end=datetime(2026, 10, 2, tzinfo=BRUSSELS_TIME_ZONE),
             ),
         ),
@@ -223,23 +231,50 @@ def build_service_points(ban: str) -> ServicePointsResponse:
     """Build the metering service points of a dual-fuel household."""
     return ServicePointsResponse(
         items=(
-            _measured_point(OFFTAKE_ONLY_EAN, "GAS", GAS_QUARTER_HOURLY_FROM),
-            _measured_point(
-                OFFTAKE_INJECTION_EAN, "ELECTRICITY", ELECTRICITY_QUARTER_HOURLY_FROM
-            ),
+            build_measured_point(OFFTAKE_ONLY_EAN, "GAS", GAS_QUARTER_HOURLY_FROM),
+            build_measured_point(OFFTAKE_INJECTION_EAN, "ELECTRICITY"),
         )
     )
 
 
-def _daily_item(day: date) -> UsageItem:
+@dataclass(frozen=True, kw_only=True)
+class UsageScenario:
+    """Variations of the usage the mocked API returns."""
+
+    offtake_offsets: Mapping[date, float] = field(default_factory=dict)
+    costs_from: date = DAILY_FROM
+    sparse_days: frozenset[date] = frozenset()
+    with_gas: bool = True
+
+
+DEFAULT_SCENARIO = UsageScenario()
+
+
+def _daily_item(day: date, scenario: UsageScenario) -> UsageItem:
     """Build a daily usage bucket with a day/night split and costs."""
-    offtake = 10.0 + day.day
     start = datetime.combine(day, time(), BRUSSELS_TIME_ZONE)
+    common = {
+        "start": _api_timestamp(start.astimezone(UTC)),
+        "end": _api_timestamp((start + timedelta(days=1)).astimezone(UTC)),
+        "partial_data": day == PARTIAL_DAY,
+    }
+    if day in scenario.sparse_days:
+        return UsageItem(
+            **common,
+            energy=UsageElectricityBreakdown(
+                injection=UsageDirectionBreakdown(kwh_sum=None)
+            ),
+        )
+    offtake = 10.0 + day.day + scenario.offtake_offsets.get(day, 0.0)
+    costs = UsageElectricityBreakdown(
+        offtake=UsageDirectionBreakdown(amount_sum=round(offtake * 0.3, 2)),
+        injection=UsageDirectionBreakdown(amount_sum=0.1),
+    )
     return UsageItem(
-        start=_api_timestamp(start.astimezone(UTC)),
-        end=_api_timestamp((start + timedelta(days=1)).astimezone(UTC)),
-        partial_data=day == PARTIAL_DAY,
-        gas=GasUsage(kwh=20.0, cost=2.0),
+        **common,
+        gas=GasUsage(kwh=20.0, cost=2.0 if day >= scenario.costs_from else None)
+        if scenario.with_gas
+        else None,
         energy=UsageElectricityBreakdown(
             offtake=UsageDirectionBreakdown(
                 kwh_sum=offtake,
@@ -253,22 +288,22 @@ def _daily_item(day: date) -> UsageItem:
                 supplier_parts=(UsageTouPart(slot_code="TOTAL_HOURS", value=2.0),),
             ),
         ),
-        costs=UsageElectricityBreakdown(
-            offtake=UsageDirectionBreakdown(amount_sum=round(offtake * 0.3, 2)),
-            injection=UsageDirectionBreakdown(amount_sum=0.1),
-        ),
+        costs=costs if day >= scenario.costs_from else None,
     )
 
 
-def _hourly_item(start: datetime) -> UsageItem:
+def _hourly_item(start: datetime, scenario: UsageScenario) -> UsageItem:
     """Build an hourly usage bucket without split or costs, like the API sends."""
     local = start.astimezone(BRUSSELS_TIME_ZONE)
+    sparse = local.date() in scenario.sparse_days
     return UsageItem(
         start=_api_timestamp(start.astimezone(UTC)),
         end=_api_timestamp((start + timedelta(hours=1)).astimezone(UTC)),
         partial_data=local.date() == PARTIAL_DAY and local.hour >= 20,
-        gas=GasUsage(kwh=1.0),
-        energy=UsageElectricityBreakdown(
+        gas=GasUsage(kwh=1.0) if scenario.with_gas and not sparse else None,
+        energy=None
+        if sparse
+        else UsageElectricityBreakdown(
             offtake=UsageDirectionBreakdown(kwh_sum=0.5),
             injection=UsageDirectionBreakdown(kwh_sum=0.1),
         ),
@@ -276,7 +311,11 @@ def _hourly_item(start: datetime) -> UsageItem:
 
 
 def build_usage_details(
-    ban: str, start_date: date, end_date: date, granularity: UsageGranularity
+    ban: str,
+    start_date: date,
+    end_date: date,
+    granularity: UsageGranularity,
+    scenario: UsageScenario = DEFAULT_SCENARIO,
 ) -> UsageDetailsResponse:
     """Build the usage buckets from the start up to the end day within the data window."""
     first = datetime.combine(max(start_date, DAILY_FROM), time(), BRUSSELS_TIME_ZONE)
@@ -285,12 +324,12 @@ def build_usage_details(
     if granularity is UsageGranularity.DAILY:
         day = first.date()
         while day < end_date:
-            items.append(_daily_item(day))
+            items.append(_daily_item(day, scenario))
             day += timedelta(days=1)
         return UsageDetailsResponse(items=tuple(items))
     moment = max(first, ELECTRICITY_QUARTER_HOURLY_FROM).astimezone(UTC)
     while moment < end.astimezone(UTC):
-        items.append(_hourly_item(moment))
+        items.append(_hourly_item(moment, scenario))
         moment += timedelta(hours=1)
     return UsageDetailsResponse(items=tuple(items))
 
@@ -408,8 +447,8 @@ def build_config_entry(
             CONF_MFA_METHOD: "sms",
             CONF_ACCESS_TOKEN: access_token,
             CONF_REFRESH_TOKEN: "refresh-token",
-            CONF_HISTORY: history.value,
         },
+        options={CONF_HISTORY: history.value},
     )
 
 
@@ -429,6 +468,8 @@ def configure_client(client: MagicMock, auth_flow: MagicMock) -> None:
     client.async_start_authentication.return_value = auth_flow
     client.async_get_service_points.side_effect = build_service_points
     client.async_get_usage_details.side_effect = build_usage_details
+    client.access_token = None
+    client.refresh_token = None
 
 
 @pytest.fixture

@@ -5,7 +5,6 @@
       'data': dict({
         'access_token': '**REDACTED**',
         'email': '**REDACTED**',
-        'history': 'none',
         'mfa_method': 'sms',
         'refresh_token': '**REDACTED**',
       }),
@@ -15,6 +14,7 @@
       'domain': 'engie_be',
       'minor_version': 2,
       'options': dict({
+        'history': 'none',
       }),
       'pref_disable_new_entities': False,
       'pref_disable_polling': False,
@@ -100,7 +100,6 @@
       'data': dict({
         'access_token': '**REDACTED**',
         'email': '**REDACTED**',
-        'history': 'none',
         'mfa_method': 'sms',
         'refresh_token': '**REDACTED**',
       }),
@@ -110,6 +109,7 @@
       'domain': 'engie_be',
       'minor_version': 2,
       'options': dict({
+        'history': 'none',
       }),
       'pref_disable_new_entities': False,
       'pref_disable_polling': False,
@@ -195,7 +195,6 @@
       'data': dict({
         'access_token': '**REDACTED**',
         'email': '**REDACTED**',
-        'history': 'none',
         'mfa_method': 'sms',
         'refresh_token': '**REDACTED**',
       }),
@@ -205,6 +204,7 @@
       'domain': 'engie_be',
       'minor_version': 2,
       'options': dict({
+        'history': 'none',
       }),
       'pref_disable_new_entities': False,
       'pref_disable_polling': False,
@@ -269,7 +269,6 @@
       'data': dict({
         'access_token': '**REDACTED**',
         'email': '**REDACTED**',
-        'history': 'none',
         'mfa_method': 'sms',
         'refresh_token': '**REDACTED**',
       }),
@@ -279,6 +278,7 @@
       'domain': 'engie_be',
       'minor_version': 2,
       'options': dict({
+        'history': 'none',
       }),
       'pref_disable_new_entities': False,
       'pref_disable_polling': False,
@@ -315,7 +315,6 @@
       'data': dict({
         'access_token': '**REDACTED**',
         'email': '**REDACTED**',
-        'history': 'none',
         'mfa_method': 'sms',
         'refresh_token': '**REDACTED**',
       }),
@@ -325,6 +324,7 @@
       'domain': 'engie_be',
       'minor_version': 2,
       'options': dict({
+        'history': 'none',
       }),
       'pref_disable_new_entities': False,
       'pref_disable_polling': False,

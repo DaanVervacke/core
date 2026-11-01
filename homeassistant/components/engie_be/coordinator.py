@@ -12,6 +12,7 @@ from aioengiebelgium import (
     CustomerAccountRelations,
     EngieBeAuthenticationError,
     EngieBeClient,
+    EngieBeCommunicationError,
     EngieBeError,
     EpexGranularity,
     EpexSlot,
@@ -477,7 +478,11 @@ class EngieBeStatisticsCoordinator(DataUpdateCoordinator[None]):
             raise ConfigEntryAuthFailed(
                 translation_domain=DOMAIN, translation_key="invalid_auth"
             ) from err
-        except EngieBeError as err:
+        except EngieBeCommunicationError as err:
             raise UpdateFailed(
                 translation_domain=DOMAIN, translation_key="cannot_connect"
+            ) from err
+        except EngieBeError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN, translation_key="statistics_import_failed"
             ) from err

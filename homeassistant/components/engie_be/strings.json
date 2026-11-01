@@ -473,6 +473,33 @@
     },
     "invalid_auth": {
       "message": "Authentication with ENGIE Belgium failed. Please reauthenticate."
+    },
+    "statistics_import_failed": {
+      "message": "Importing the usage history from ENGIE Belgium failed."
+    }
+  },
+  "options": {
+    "abort": {
+      "entry_not_loaded": "The integration must be loaded before its options can be changed."
+    },
+    "progress": {
+      "import_history": "[%key:component::engie_be::config::progress::import_history%]"
+    },
+    "step": {
+      "import_failed": {
+        "description": "[%key:component::engie_be::config::step::import_failed::description%]",
+        "title": "[%key:component::engie_be::config::step::import_failed::title%]"
+      },
+      "init": {
+        "data": {
+          "history": "[%key:component::engie_be::config::step::history::data::history%]"
+        },
+        "data_description": {
+          "history": "[%key:component::engie_be::config::step::history::data_description::history%]"
+        },
+        "description": "Choose how much usage history to import into the energy dashboard. A deeper history is imported right away, and new usage keeps being imported automatically. Choosing None stops importing new usage but keeps the statistics that were already imported.",
+        "title": "[%key:component::engie_be::config::step::history::title%]"
+      }
     }
   },
   "selector": {

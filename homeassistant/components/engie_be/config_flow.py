@@ -16,8 +16,15 @@ from aioengiebelgium import (
 import probatio
 
 from homeassistant.components.recorder import get_instance
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    ConfigEntryState,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_EMAIL, CONF_PASSWORD
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
@@ -33,6 +40,9 @@ from .const import (
 from .coordinator import active_agreements, household_name
 from .importer import async_import_household_statistics
 
+if TYPE_CHECKING:
+    from . import EngieBeConfigEntry
+
 _MFA_METHOD_SELECTOR = selector.SelectSelector(
     selector.SelectSelectorConfig(
         options=[method.value for method in MfaMethod],
@@ -40,18 +50,40 @@ _MFA_METHOD_SELECTOR = selector.SelectSelector(
     )
 )
 _CODE_SCHEMA = probatio.Schema({probatio.Required("code"): str})
-_HISTORY_SCHEMA = probatio.Schema(
-    {
-        probatio.Required(CONF_HISTORY, default=HistoryDepth.YEAR.value): (
-            selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=[depth.value for depth in HistoryDepth],
-                    translation_key=CONF_HISTORY,
-                )
-            )
-        )
-    }
+_HISTORY_SELECTOR = selector.SelectSelector(
+    selector.SelectSelectorConfig(
+        options=[depth.value for depth in HistoryDepth],
+        translation_key=CONF_HISTORY,
+    )
 )
+
+
+def _history_schema(default: HistoryDepth) -> probatio.Schema:
+    """Return the history depth form with the given default."""
+    return probatio.Schema(
+        {probatio.Required(CONF_HISTORY, default=default.value): _HISTORY_SELECTOR}
+    )
+
+
+async def _async_import_history(
+    hass: HomeAssistant, client: EngieBeClient, depth: HistoryDepth
+) -> bool:
+    """Import the usage history of every household and return whether it worked."""
+    try:
+        relations = await client.async_get_customer_account_relations()
+        for ban, agreement in active_agreements(relations).items():
+            await async_import_household_statistics(
+                hass, client, ban, household_name(ban, agreement), depth, backfill=True
+            )
+    except EngieBeError as err:
+        LOGGER.warning("Importing the usage history failed: %s", err)
+        return False
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("Unexpected error while importing the usage history")
+        return False
+    # Commit before setup so the first scheduled import sees the stored statistics.
+    await get_instance(hass).async_block_till_done()
+    return True
 
 
 class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -59,6 +91,13 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
     MINOR_VERSION = 2
+
+    @override
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: EngieBeConfigEntry) -> EngieBeOptionsFlow:
+        """Return the options flow."""
+        return EngieBeOptionsFlow()
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -70,7 +109,6 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._tokens: tuple[str, str] | None = None
         self._depth = HistoryDepth.NONE
         self._import_task: asyncio.Task[bool] | None = None
-        self._import_failed_shown = False
 
     async def _async_start_authentication(
         self, user_input: dict[str, Any]
@@ -214,7 +252,9 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Ask how much usage history to import into the energy dashboard."""
         if user_input is None:
-            return self.async_show_form(step_id="history", data_schema=_HISTORY_SCHEMA)
+            return self.async_show_form(
+                step_id="history", data_schema=_history_schema(HistoryDepth.YEAR)
+            )
         self._depth = HistoryDepth(user_input[CONF_HISTORY])
         if self._depth is HistoryDepth.NONE:
             return self._async_create_account_entry()
@@ -225,8 +265,12 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Import the usage history while showing progress."""
         if self._import_task is None:
+            client = self._client
+            if TYPE_CHECKING:
+                assert client is not None
             self._import_task = self.hass.async_create_task(
-                self._async_import_history(), "engie_be history import"
+                _async_import_history(self.hass, client, self._depth),
+                "engie_be history import",
             )
         if not self._import_task.done():
             return self.async_show_progress(
@@ -249,34 +293,19 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Tell the user the import is retried after setup, then create the entry."""
         # A progress task that finishes at once forwards the history step's input here.
-        if not self._import_failed_shown:
-            self._import_failed_shown = True
+        if user_input is None or CONF_HISTORY in user_input:
             return self.async_show_form(step_id="import_failed")
         return self._async_create_account_entry()
 
-    async def _async_import_history(self) -> bool:
-        """Import the usage history of every household and return whether it worked."""
-        client = self._client
-        if TYPE_CHECKING:
-            assert client is not None
-        try:
-            relations = await client.async_get_customer_account_relations()
-            for ban, agreement in active_agreements(relations).items():
-                await async_import_household_statistics(
-                    self.hass, client, ban, household_name(ban, agreement), self._depth
-                )
-        except EngieBeError as err:
-            LOGGER.warning("Importing the usage history failed: %s", err)
-            return False
-        await get_instance(self.hass).async_block_till_done()
-        return True
-
     def _async_create_account_entry(self) -> ConfigFlowResult:
-        """Create the config entry with the tokens and the chosen history depth."""
+        """Create the config entry with the current tokens and the history depth."""
         if TYPE_CHECKING:
             assert self._email is not None
+            assert self._client is not None
             assert self._tokens is not None
-        access_token, refresh_token = self._tokens
+        # The client may have rotated the tokens while the history was imported.
+        access_token = self._client.access_token or self._tokens[0]
+        refresh_token = self._client.refresh_token or self._tokens[1]
         return self.async_create_entry(
             title=self._email,
             data={
@@ -284,6 +313,75 @@ class EngieBeConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_MFA_METHOD: self._mfa_method.value,
                 CONF_ACCESS_TOKEN: access_token,
                 CONF_REFRESH_TOKEN: refresh_token,
-                CONF_HISTORY: self._depth.value,
             },
+            options={CONF_HISTORY: self._depth.value},
         )
+
+
+class EngieBeOptionsFlow(OptionsFlowWithReload):
+    """Handle the ENGIE Belgium options."""
+
+    config_entry: EngieBeConfigEntry
+
+    def __init__(self) -> None:
+        """Initialize the options flow."""
+        self._depth = HistoryDepth.NONE
+        self._import_task: asyncio.Task[bool] | None = None
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask how much usage history to import and keep up to date."""
+        if self.config_entry.state is not ConfigEntryState.LOADED:
+            return self.async_abort(reason="entry_not_loaded")
+        if user_input is None:
+            return self.async_show_form(
+                step_id="init",
+                data_schema=_history_schema(
+                    HistoryDepth(self.config_entry.options[CONF_HISTORY])
+                ),
+            )
+        self._depth = HistoryDepth(user_input[CONF_HISTORY])
+        if self._depth is HistoryDepth.NONE:
+            return self._async_save()
+        return await self.async_step_import_history()
+
+    async def async_step_import_history(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Import the usage history while showing progress."""
+        if self._import_task is None:
+            self._import_task = self.hass.async_create_task(
+                _async_import_history(
+                    self.hass, self.config_entry.runtime_data.client, self._depth
+                ),
+                "engie_be history import",
+            )
+        if not self._import_task.done():
+            return self.async_show_progress(
+                step_id="import_history",
+                progress_action="import_history",
+                progress_task=self._import_task,
+            )
+        if self._import_task.result():
+            return self.async_show_progress_done(next_step_id="finish")
+        return self.async_show_progress_done(next_step_id="import_failed")
+
+    async def async_step_finish(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Save the options after a successful history import."""
+        return self._async_save()
+
+    async def async_step_import_failed(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Tell the user the import is retried in the background, then save."""
+        # A progress task that finishes at once forwards the init step's input here.
+        if user_input is None or CONF_HISTORY in user_input:
+            return self.async_show_form(step_id="import_failed")
+        return self._async_save()
+
+    def _async_save(self) -> ConfigFlowResult:
+        """Save the chosen history depth."""
+        return self.async_create_entry(data={CONF_HISTORY: self._depth.value})
