@@ -1,7 +1,8 @@
 """Test the ENGIE Belgium usage history import."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import partial
+from http import HTTPStatus
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -11,6 +12,7 @@ from aioengiebelgium import (
     EngieBeError,
     MeteringServicePoint,
     ServicePointsResponse,
+    UsageDetailsResponse,
     UsageGranularity,
 )
 from freezegun.api import FrozenDateTimeFactory
@@ -51,7 +53,7 @@ from .conftest import (
 )
 
 GAS_COST_STATISTIC_ID = f"{DOMAIN}:{BAN}_gas_cost"
-HIGH_LOAD_STATISTIC_ID = f"{DOMAIN}:{BAN}_electricity_offtake_high_load_hours"
+PEAK_STATISTIC_ID = f"{DOMAIN}:{BAN}_electricity_offtake_peak"
 TODAY = date(2026, 10, 3)
 
 
@@ -128,6 +130,20 @@ def _use_scenario(client: MagicMock, scenario: UsageScenario) -> None:
     client.async_get_usage_details.side_effect = partial(
         build_usage_details, scenario=scenario
     )
+
+
+def _refuse_large_requests(
+    ban: str, start_date: date, end_date: date, granularity: UsageGranularity
+) -> UsageDetailsResponse:
+    """Refuse more than one day of hourly or one calendar month of daily usage."""
+    largest_end = (
+        start_date + timedelta(days=1)
+        if granularity is UsageGranularity.HOURLY
+        else (start_date.replace(day=1) + timedelta(days=32)).replace(day=1)
+    )
+    if end_date > largest_end:
+        raise EngieBeCommunicationError("too large", status=HTTPStatus.BAD_REQUEST)
+    return build_usage_details(ban, start_date, end_date, granularity)
 
 
 def _use_service_points(client: MagicMock, *points: MeteringServicePoint) -> None:
@@ -262,7 +278,7 @@ async def test_backfill_skips_missing_values(
     assert (
         _summary(
             await _hourly_rows(hass),
-            {OFFTAKE_STATISTIC_ID, GAS_STATISTIC_ID, HIGH_LOAD_STATISTIC_ID},
+            {OFFTAKE_STATISTIC_ID, GAS_STATISTIC_ID, PEAK_STATISTIC_ID},
         )
         == snapshot
     )
@@ -388,6 +404,37 @@ async def test_import_retried_after_failure(
 
 
 @pytest.mark.usefixtures("frozen_afternoon")
+async def test_import_uses_smaller_requests_after_refusal(
+    hass: HomeAssistant, mock_engie_client: MagicMock
+) -> None:
+    """Test refused large requests are retried in the app's smaller steps."""
+    client = mock_engie_client.return_value
+    client.async_get_usage_details.side_effect = _refuse_large_requests
+
+    await _setup_with_history(hass)
+
+    rows = await _hourly_rows(hass)
+    # Same total as a backfill with large requests.
+    assert rows[OFFTAKE_STATISTIC_ID][-1]["sum"] == pytest.approx(326.0)
+    ranges = {
+        granularity: [
+            (call.args[1], call.args[2])
+            for call in client.async_get_usage_details.call_args_list
+            if call.args[3] is granularity
+        ]
+        for granularity in (UsageGranularity.DAILY, UsageGranularity.HOURLY)
+    }
+    assert ranges[UsageGranularity.DAILY] == [
+        (DAILY_FROM, TODAY),
+        (DAILY_FROM, date(2026, 10, 1)),
+        (date(2026, 10, 1), TODAY),
+    ]
+    assert {end - start for start, end in ranges[UsageGranularity.HOURLY][1:]} == {
+        timedelta(days=1)
+    }
+
+
+@pytest.mark.usefixtures("frozen_afternoon")
 async def test_import_auth_error_starts_reauth(
     hass: HomeAssistant, mock_engie_client: MagicMock
 ) -> None:
@@ -407,6 +454,16 @@ async def test_import_auth_error_starts_reauth(
     "exception",
     [
         pytest.param(EngieBeCommunicationError("boom"), id="communication"),
+        pytest.param(
+            EngieBeCommunicationError("refused", status=HTTPStatus.BAD_REQUEST),
+            id="refused",
+        ),
+        pytest.param(
+            EngieBeCommunicationError(
+                "unavailable", status=HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
+            id="server_error",
+        ),
         pytest.param(EngieBeError("boom"), id="other"),
     ],
 )

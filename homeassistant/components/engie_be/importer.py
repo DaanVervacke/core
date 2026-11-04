@@ -1,11 +1,14 @@
 """Import ENGIE Belgium usage history into long-term statistics."""
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from http import HTTPStatus
+import re
 
 from aioengiebelgium import (
     EngieBeClient,
+    EngieBeCommunicationError,
     MeasuredDataWindow,
     MeteringServicePoint,
     UsageDirectionBreakdown,
@@ -35,7 +38,9 @@ from .const import BRUSSELS_TIME_ZONE, DOMAIN, LOGGER, HistoryDepth
 ELECTRICITY = "ELECTRICITY"
 GAS = "GAS"
 
-_TOTAL_SLOT_CODE = "TOTAL_HOURS"
+# The ENGIE Belgium app only shows supplier slots whose code contains "tou".
+_TOU_MARKER = "tou"
+_TOU_SLOT = re.compile(r"S_TOU\d+_(?:OFFTAKE|INJECTION)_(?P<period>.+)")
 _ANCHOR_KEYS = {ELECTRICITY: "electricity_offtake", GAS: "gas"}
 _DEPTHS = {
     HistoryDepth.MONTH: timedelta(days=31),
@@ -49,6 +54,21 @@ FALLBACK_LOOKBACK = timedelta(days=3 * 365)
 # The API documents no range limit, so stay conservative per request.
 DAILY_CHUNK = timedelta(days=92)
 HOURLY_CHUNK = timedelta(days=31)
+
+
+def _next_day(day: date) -> date:
+    return day + timedelta(days=1)
+
+
+def _first_of_next_month(day: date) -> date:
+    return (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+
+
+# The ENGIE Belgium app requests one day of hourly or one month of daily usage.
+_APP_STEPS: dict[UsageGranularity, Callable[[date], date]] = {
+    UsageGranularity.DAILY: _first_of_next_month,
+    UsageGranularity.HOURLY: _next_day,
+}
 
 
 @dataclass(frozen=True)
@@ -140,13 +160,30 @@ async def _async_fetch_usage(
     granularity: UsageGranularity,
     chunk: timedelta,
 ) -> dict[datetime, UsageItem]:
-    """Fetch complete, hour-aligned usage buckets between the days in chunks."""
+    """Fetch complete, hour-aligned usage buckets between the days in chunks.
+
+    When the API refuses a chunk, the rest is fetched in the app's smaller steps.
+    """
     items: dict[datetime, UsageItem] = {}
+    app_step = _APP_STEPS[granularity]
+    large_chunks = True
     while start < end:
-        chunk_end = min(start + chunk, end)
-        response = await client.async_get_usage_details(
-            ban, start, chunk_end, granularity
-        )
+        chunk_end = min(start + chunk if large_chunks else app_step(start), end)
+        try:
+            response = await client.async_get_usage_details(
+                ban, start, chunk_end, granularity
+            )
+        except EngieBeCommunicationError as err:
+            if not large_chunks or not _is_refused_request(err):
+                raise
+            LOGGER.debug(
+                "ENGIE Belgium refused %s usage from %s to %s, using smaller requests",
+                granularity,
+                start,
+                chunk_end,
+            )
+            large_chunks = False
+            continue
         for item in response.items:
             start_utc = item.start.astimezone(dt_util.UTC)
             if item.partial_data or start_utc != start_utc.replace(
@@ -156,6 +193,19 @@ async def _async_fetch_usage(
             items[item.start] = item
         start = chunk_end
     return items
+
+
+def _is_refused_request(err: EngieBeCommunicationError) -> bool:
+    return err.status is not None and (
+        HTTPStatus.BAD_REQUEST <= err.status < HTTPStatus.INTERNAL_SERVER_ERROR
+    )
+
+
+def _slot_name(slot_code: str) -> str:
+    """Return the period of a time-of-use slot code, such as peak."""
+    if match := _TOU_SLOT.fullmatch(slot_code):
+        return match["period"]
+    return slot_code
 
 
 def _select(
@@ -253,11 +303,12 @@ class _SeriesBuilder:
         if breakdown is None:
             return
         for part in breakdown.supplier_parts:
-            if part.slot_code == _TOTAL_SLOT_CODE:
+            if _TOU_MARKER not in part.slot_code.lower():
                 continue
+            name = _slot_name(part.slot_code)
             self.add(
-                f"electricity_{direction}_{slugify(part.slot_code)}",
-                f"electricity {direction} {part.slot_code.replace('_', ' ').lower()}",
+                f"electricity_{direction}_{slugify(name)}",
+                f"electricity {direction} {name.replace('_', ' ').lower()}",
                 start,
                 part.value,
             )

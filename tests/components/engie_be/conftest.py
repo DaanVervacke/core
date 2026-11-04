@@ -251,7 +251,7 @@ DEFAULT_SCENARIO = UsageScenario()
 
 
 def _daily_item(day: date, scenario: UsageScenario) -> UsageItem:
-    """Build a daily usage bucket with a day/night split and costs."""
+    """Build a daily usage bucket with a time-of-use split and costs."""
     start = datetime.combine(day, time(), BRUSSELS_TIME_ZONE)
     common = {
         "start": _api_timestamp(start.astimezone(UTC)),
@@ -279,13 +279,19 @@ def _daily_item(day: date, scenario: UsageScenario) -> UsageItem:
             offtake=UsageDirectionBreakdown(
                 kwh_sum=offtake,
                 supplier_parts=(
-                    UsageTouPart(slot_code="HIGH_LOAD_HOURS", value=offtake * 0.6),
-                    UsageTouPart(slot_code="LOW_LOAD_HOURS", value=offtake * 0.4),
+                    UsageTouPart(slot_code="S_TOU1_OFFTAKE_PEAK", value=offtake * 0.6),
+                    UsageTouPart(
+                        slot_code="S_TOU1_OFFTAKE_OFFPEAK", value=offtake * 0.4
+                    ),
                 ),
             ),
             injection=UsageDirectionBreakdown(
                 kwh_sum=2.0,
-                supplier_parts=(UsageTouPart(slot_code="TOTAL_HOURS", value=2.0),),
+                # A code without "tou" is no time-of-use slot, an unknown one keeps its name.
+                supplier_parts=(
+                    UsageTouPart(slot_code="TOTAL_HOURS", value=2.0),
+                    UsageTouPart(slot_code="FLEX_TOU", value=2.0),
+                ),
             ),
         ),
         costs=costs if day >= scenario.costs_from else None,
